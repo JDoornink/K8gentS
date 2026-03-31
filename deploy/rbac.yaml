@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8gent-sa
+  namespace: k8gent-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8gent-readonly-role
+rules:
+  # The Agent is strictly read-only by default.
+  # Permission to view pods, namespaces, nodes, events, services, etc.
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - namespaces
+      - nodes
+      - events
+      - services
+      - endpoints
+      - persistentvolumes
+      - persistentvolumeclaims
+      - configmaps
+      - secrets # Caution: Needed for deep RCA (e.g., verifying secret existence), can remove if too broad
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - daemonsets
+      - statefulsets
+      - replicasets
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - ingresses
+      - networkpolicies
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8gent-readonly-binding
+subjects:
+  - kind: ServiceAccount
+    name: k8gent-sa
+    namespace: k8gent-system
+roleRef:
+  kind: ClusterRole
+  name: k8gent-readonly-role
+  apiGroup: rbac.authorization.k8s.io

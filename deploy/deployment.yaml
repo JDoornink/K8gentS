@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8gent
+  namespace: k8gent-system
+  labels:
+    app: k8gent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8gent
+  template:
+    metadata:
+      labels:
+        app: k8gent
+    spec:
+      serviceAccountName: k8gent-sa
+      # Pod-level security context ensures the process cannot run as root
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 3000
+        fsGroup: 2000
+      containers:
+        - name: agent
+          image: k8gent/agent:latest # Replace with actual published image
+          imagePullPolicy: IfNotPresent
+          # Container-level security context drops all Linux capabilities and prevents privilege escalation
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: WATCH_NAMESPACES
+              value: "all"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: AI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: k8gent-secrets
+                  key: AI_API_KEY
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: k8gent-secrets
+                  key: SLACK_BOT_TOKEN
+            - name: SLACK_APP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: k8gent-secrets
+                  key: SLACK_APP_TOKEN
+            - name: SLACK_CHANNEL_ID
+              valueFrom:
+                secretKeyRef:
+                  name: k8gent-secrets
+                  key: SLACK_CHANNEL_ID
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
