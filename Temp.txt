@@ -106,3 +106,8 @@ if rca_response['confidence_score'] < 70:
 else:
     execute_auto_remediation(rca_response['suggested_fix']) # Optional auto-pilot mode
 This setup directly targets the "toil" of SRE work by automating the most time-consuming part: identifying why something broke among thousands of lines of logs.
+
+
+
+Tomorrow, when you start a fresh chat, you can literally just say:
+"Read AGENT.md and let's start on step 1 of the action items."

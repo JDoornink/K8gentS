@@ -6,7 +6,7 @@
 ---
 
 ## 📖 Overview
-**K8gentS** acts as a dedicated observer within your Kubernetes cluster. Designed as an SRE assistant equipped with Deep Kubernetes Knowledge (CKA/CKS level), it leverages Large Language Models (LLMs) like **Claude 4.6 Opus** and robust system telemetry to automatically diagnose pod failures, resource exhaustion, and network bottlenecks. Its goal is to drastically reduce operational mean time to repair (MTTR).
+**K8gentS** acts as a dedicated observer within your Kubernetes cluster. Designed as an SRE assistant equipped with Deep Kubernetes Knowledge (CKA/CKS level), it leverages Large Language Models (LLMs) like **Google Gemini 3.1 Pro** and robust system telemetry to automatically diagnose pod failures, resource exhaustion, and network bottlenecks. Its goal is to drastically reduce operational mean time to repair (MTTR).
 
 ## ✨ Core Responsibilities
 1. **Continuous Monitoring:** Watches the cluster for error events, crashed pods, `CrashLoopBackOff` states, `OOMKilled` events, and other failure conditions such as `Connectivity/DNS`, `Database Deadlock`, or `Secret/Config Missing`.
@@ -33,7 +33,7 @@
 ### Prerequisites
 - A Kubernetes cluster (compatible with v1.20+)
 - `kubectl` configured and authenticated to the target cluster.
-- AI Provider API Key (e.g., Anthropic Claude API Key).
+- AI Provider API Key (e.g., Google Gemini API Key).
 - A Docker Registry to push the agent's image to.
 
 ### 1. Configure Slack (Socket Mode)
@@ -86,4 +86,13 @@ kubectl logs -l app=k8gent -n k8gent-system -f
 ---
 
 ## 🔮 Future Customization
-To define what specific namespaces or events to watch, or to utilize different LLM APIs (e.g., local open-weight models), simply modify the `WATCH_NAMESPACES` and `AI_MODEL` environment variables defined in the `deployment.yaml`.
+To define what specific namespaces or events to watch, or to utilize different LLM architectures, simply modify the `WATCH_NAMESPACE` and `AI_MODEL` environment variables defined in the `deployment.yaml` (or in your local shell). If `WATCH_NAMESPACE` is omitted, the agent will monitor all namespaces globally.
+
+> **Note on LLM Upgrades:** If Google releases a newer model version (e.g., Gemini 3.5 or 4.0), you do not need to modify the Python codebase. You can simply set `$env:AI_MODEL="gemini-new-model-name"` before running the script, and the agent will dynamically route internal tracking and prompts to the newest reasoning engine.
+
+---
+
+## 🚀 Where to go from here
+The core monitoring pipeline is fully functional! The next phase of development focuses on executing automated remediation.
+- In `src/main.py`, the interactive Slack buttons (like **"Approve Fix"**) currently trigger a simulated API patch (`time.sleep(2)`).
+- The next step is to bind those handler functions to genuine Kubernetes API patching commands so the agent can securely execute the suggested remediation plan the moment a human clicks "Approve".
