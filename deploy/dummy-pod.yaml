@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rca-agent-test
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: failing-db-pod
+  namespace: rca-agent-test
+spec:
+  containers:
+  - name: dummy-db
+    image: postgres:alpine
+    command: ["/bin/sh", "-c"]
+    args: 
+      - |
+        echo "Starting dummy database..."
+        sleep 2
+        echo "FATAL: Missing POSTGRES_PASSWORD environment variable or misconfigured secret."
+        echo "The database cannot start without a specified auth token."
+        exit 1
+  restartPolicy: Always
+

@@ -5,10 +5,12 @@ import re
 from datetime import datetime, timedelta
 from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
-from anthropic import Anthropic
+from google import genai
+from google.genai import types
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 import threading
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("K8gentRCA")
@@ -37,14 +39,25 @@ def handle_approve_fix(ack, body, logger):
         text="Fix applied successfully! 🛠️"
     )
 
-@app.action("cancel_fix")
-def handle_cancel_fix(ack, body, logger):
+@app.action("forward_message")
+def handle_forward_message(ack, body, logger):
+    ack()
+    user = body["user"]["id"]
+    # In a real implementation, this would open a Slack Modal `users_select`
+    app.client.chat_postMessage(
+        channel=body["channel"]["id"],
+        thread_ts=body["message"]["ts"],
+        text=f"<@{user}> Requested to forward the message to another user. (Select User Modal Placeholder)"
+    )
+
+@app.action("disregard_alert")
+def handle_disregard_alert(ack, body, logger):
     ack()
     user = body["user"]["id"]
     app.client.chat_postMessage(
         channel=body["channel"]["id"],
         thread_ts=body["message"]["ts"],
-        text=f"<@{user}> Cancelled the operation. Agent will stand down."
+        text=f"<@{user}> Disregarded the alert. Agent will stand down."
     )
 
 class RCAAgent:
@@ -58,8 +71,8 @@ class RCAAgent:
             
         self.v1 = client.CoreV1Api()
         
-        self.ai_client = Anthropic(api_key=os.environ.get("AI_API_KEY"))
-        self.ai_model = os.environ.get("AI_MODEL", "claude-4.6-opus-20260224")
+        self.ai_client = genai.Client(api_key=os.environ.get("AI_API_KEY"))
+        self.ai_model = os.environ.get("AI_MODEL", "gemini-2.5-pro")
 
         # Rate Limiting & Debouncing Cache: Prevents the Agent from bankrupting your token budget!
         # Maps "Namespace/Pod-Name:Reason" to Timestamp
@@ -74,21 +87,30 @@ class RCAAgent:
         if not slack_bot_token or not slack_app_token:
             logger.warning("Missing SLACK_BOT_TOKEN or SLACK_APP_TOKEN in environment variables.")
 
-    def run(self):
-        # Start the Slack Socket Mode handler in a background thread
-        logger.info("Starting Slack Socket Mode Thread...")
-        socket_thread = threading.Thread(
-            target=lambda: SocketModeHandler(app, os.environ.get("SLACK_APP_TOKEN")).start()
-        )
-        socket_thread.daemon = True
-        socket_thread.start()
-
-        logger.info("Starting K8gent-S Watcher...")
-        w = watch.Watch()
-        for event in w.stream(self.v1.list_event_for_all_namespaces):
+    def run_watcher(self):
+        watch_namespace = os.environ.get("WATCH_NAMESPACE")
+        
+        if watch_namespace:
+            logger.info(f"Starting K8gent-S Watcher (Restricted natively to namespace: {watch_namespace})...")
+            stream = watch.Watch().stream(self.v1.list_namespaced_event, namespace=watch_namespace)
+        else:
+            logger.info("Starting K8gent-S Watcher (Global Scope)...")
+            stream = watch.Watch().stream(self.v1.list_event_for_all_namespaces)
+            
+        for event in stream:
             event_obj = event['object']
             if event_obj.type == "Warning":
                 self.handle_error_event(event_obj)
+
+    def run(self):
+        # Start the K8s Watcher in a background thread
+        watcher_thread = threading.Thread(target=self.run_watcher)
+        watcher_thread.daemon = True
+        watcher_thread.start()
+
+        # Start the Slack Socket Mode handler in the main thread (needed for signal handling)
+        logger.info("Starting Slack Socket Mode...")
+        SocketModeHandler(app, os.environ.get("SLACK_APP_TOKEN")).start()
 
     def handle_error_event(self, event_obj):
         reason = event_obj.reason
@@ -139,6 +161,13 @@ class RCAAgent:
         context = []
         try:
             logs = self.v1.read_namespaced_pod_log(name=pod_name, namespace=namespace, tail_lines=50)
+            if not logs.strip():
+                # Attempt to get previous container logs if current is empty (common in crashes)
+                try:
+                    logs = self.v1.read_namespaced_pod_log(name=pod_name, namespace=namespace, tail_lines=50, previous=True)
+                except ApiException:
+                    pass
+                    
             sanitized_logs = self.sanitize_logs(logs)
             context.append(f"--- POD LOGS (tail 50) ---\n{sanitized_logs}")
         except ApiException as e:
@@ -174,36 +203,69 @@ class RCAAgent:
         truncated_context = context[:5000] if len(context) > 5000 else context
         
         prompt = f"""
-        You are an expert Kubernetes Site Reliability Engineer (CKA/CKS). 
-        An error has occurred:
-        Reason: {reason}
-        Message: {message}
-        Involved Object: {involved_object.kind}/{involved_object.name}
-        Context: {truncated_context}
+You are a Senior Site Reliability Engineer (SRE) with Kubernetes credentails (CKA, CKS) specialized in Automated Root Cause Analysis (RCA). Your task is to analyze raw system logs, identify the underlying failure, and provide a remediation plan.
+
+Input Context:
+Reason: {reason}
+Message: {message}
+Involved Object: {involved_object.kind}/{involved_object.name}
+Logs/Events:
+{truncated_context}
+
+Environment: Kubernetes Cluster (Production)
+
+Analysis Requirements:
+Categorization: Classify the error (e.g., OOMKilled, CrashLoopBackOff, Connectivity/DNS, Database Deadlock, Secret/Config Missing).
+Root Cause: Explain why the error occurred based strictly on the log patterns.
+Suggested Fix: Provide a step-by-step technical resolution (kubectl commands, code changes, or config updates).
+Confidence Score: Assign a percentage (0-100) indicating your certainty in the fix.
+Crucial: If your Confidence Score is less than 75, you must set escalation_required to true.
+
+Output Format (Strict JSON):
+{{
+  "incident_id": "RCA-XXXX",
+  "category": "String",
+  "root_cause": "String",
+  "suggested_fix": "String",
+  "confidence_score": 0,
+  "escalation_required": false
+}}
+"""
         
-        Provide the Top 3 possible root causes along with a confidence metric (percentage).
-        Also provide step-by-step instructions on how to fix this issue safely.
-        Format your response nicely.
-        """
-        
-        # Native Anthropic Claude API Call
+        # Google Gemini API Call
         try:
-            response = self.ai_client.messages.create(
+            response = self.ai_client.models.generate_content(
                 model=self.ai_model,
-                max_tokens=1000,
-                temperature=0.2,
-                system="You are an expert Kubernetes AI assistant.",
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction="You are an expert Kubernetes AI assistant. Always return ONLY valid JSON.",
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                )
             )
-            ai_text = response.content[0].text
+            ai_text = response.text
+            
+            # Attempt to extract JSON from response
+            json_str = ai_text
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```")[1].split("```")[0].strip()
+                
+            rca_data = json.loads(json_str)
         except Exception as e:
-            logger.error(f"Failed to query AI: {e}")
-            ai_text = f"*AI Diagnostic failed. Exception: {e}*"
+            logger.error(f"Failed to query AI or parse JSON: {e}")
+            rca_data = {
+                "incident_id": "UNKNOWN",
+                "category": "Error",
+                "root_cause": f"AI Diagnostic failed. Exception: {e}",
+                "suggested_fix": "Investigate manually.",
+                "confidence_score": 0,
+                "escalation_required": True
+            }
 
         return {
-            "ai_analysis": ai_text,
+            "rca_data": rca_data,
             "object_ref": f"{involved_object.kind}/{involved_object.name} in {involved_object.namespace}",
             "raw_context": f"{involved_object.namespace}/{involved_object.kind}/{involved_object.name}"
         }
@@ -212,44 +274,68 @@ class RCAAgent:
         if not os.environ.get("SLACK_CHANNEL_ID"):
             return
             
+        rca_data = rca_result.get("rca_data", {})
+        object_ref = rca_result["object_ref"]
+        confidence = rca_data.get("confidence_score", 0)
+        escalate = rca_data.get("escalation_required", True)
+        
         blocks = [
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"*⚠️ K8s Alert:* `{rca_result['object_ref']}`\n\n*Agent RCA Diagnosis:*\n{rca_result['ai_analysis']}"
+                    "text": f"*⚠️ K8s Alert:* `{object_ref}`\n*Category:* {rca_data.get('category', 'Unknown')}\n*Confidence Score:* {confidence}%\n\n*Root Cause:*\n{rca_data.get('root_cause', 'N/A')}\n\n*Suggested Fix:*\n{rca_data.get('suggested_fix', 'N/A')}"
                 }
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {
-                            "type": "plain_text",
-                            "text": "Approve Fix (Agent Execution)"
-                        },
-                        "style": "danger",
-                        "value": rca_result['raw_context'],
-                        "action_id": "approve_fix"
-                    },
-                    {
-                        "type": "button",
-                        "text": {
-                            "type": "plain_text",
-                            "text": "I'll do it manually"
-                        },
-                        "value": "cancel",
-                        "action_id": "cancel_fix"
-                    }
-                ]
             }
         ]
+        
+        if confidence < 75 or escalate:
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*🚨 ACTION_REQUIRED: ESCALATE_TO_HUMAN*\nConfidence score is too low for auto-remediation. Human-in-the-loop required."
+                }
+            })
+
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Approve the LLM to fix it"
+                    },
+                    "style": "danger",
+                    "value": rca_result['raw_context'],
+                    "action_id": "approve_fix"
+                },
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Forward message to another slack user"
+                    },
+                    "value": rca_result['raw_context'],
+                    "action_id": "forward_message"
+                },
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Disregard"
+                    },
+                    "value": "cancel",
+                    "action_id": "disregard_alert"
+                }
+            ]
+        })
         
         try:
             app.client.chat_postMessage(
                 channel=os.environ.get("SLACK_CHANNEL_ID"),
-                text=f"Kubernetes Alert: {rca_result['object_ref']}",
+                text=f"Kubernetes Alert: {object_ref}",
                 blocks=blocks
             )
             logger.info("Sent Interactive Slack notification.")

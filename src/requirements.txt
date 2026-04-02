@@ -1,4 +1,4 @@
 kubernetes>=28.1.0
 requests>=2.31.0
 slack_bolt>=1.18.1
-anthropic>=0.18.0
+google-genai>=0.1.0
