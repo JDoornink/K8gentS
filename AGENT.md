@@ -45,3 +45,10 @@ During the last session, we successfully completed **Phase 1: End-to-End RCA Mon
 1. **Automated Remediation Work:** The agent currently sends the Interactive Slack payload flawlessly, but clicking the "Approve Fix" button simply fires a simulated `time.sleep(2)` log.
 2. **Bind the Execution Hooks:** Navigate to `src/main.py` and replace the simulated button action handlers with genuine Kubernetes API commands. Define how the Agent should actually apply the `"suggested_fix"` safely into the target namespace upon human approval.
 3. Start creating some unit tests to verify the agent's functionality.
+
+### 🔮 Phase 3: Post-Remediation Verification & Rollback
+Once the core execution hooks are bound, implement a closed-loop validation workflow:
+1. **Verification Loop:** After the LLM executes a fix, the Agent should automatically monitor the target namespace for 30-60 seconds to verify if the pod successfully transitions to a `Running/Ready` state.
+2. **Follow-Up Slack Webhook:** Send a follow-up message to the thread indicating whether the fix was successful or if the crash state persists.
+3. **Interactive Rollback:** If the fix fails (or if the user identifies a regression), provide a "Rollback Fix" interactive button on the Slack payload.
+4. **Execution Reversal:** When "Rollback Fix" is clicked, the Agent must programmatically reverse the changes (e.g., reverting to the previous deployment generation via `kubectl rollout undo` or deleting the strictly newly-applied API patch).
