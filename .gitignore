@@ -136,6 +136,8 @@ celerybeat.pid
 
 # K8gentS local config — never commit these
 approvers.local
+data/k8gent.db
+data/settings.json
 
 # Environments
 .env

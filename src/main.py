@@ -5,6 +5,8 @@ import json
 import uuid
 import subprocess
 from datetime import datetime, timedelta
+from string import Template
+from dashboard import init_db, start_dashboard, log_activity, get_setting
 from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
 from google import genai
@@ -16,6 +18,10 @@ import threading
 # Secure in-memory store: maps incident_id → full rca_data dict.
 # Decouples LLM generation from asynchronous human approval.
 pending_fixes = {}
+
+# Maps incident_id → rollback_data dict for actions that can be reversed.
+# Populated after a successful remediation; consumed when the user clicks Undo.
+pending_rollbacks = {}
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("K8gentRCA")
 
@@ -129,36 +135,209 @@ def handle_approve_fix(ack, body, logger):
                 text=True
             )
             result_text = process.stdout.strip() or "Command completed with no output."
+            rollback_data = None  # subprocess mode has no structured rollback
         else:
             # Default (api) mode: use the Kubernetes Python client directly.
             # Works in-cluster via ServiceAccount token. No binary or kubeconfig needed.
-            result_text = agent_instance.execute_remediation_api(rca_data)
+            result_text, rollback_data = agent_instance.execute_remediation_api(rca_data)
 
         # Consume the fix entry to prevent replay
         pending_fixes.pop(incident_id, None)
 
+        log_activity(
+            incident_id=rca_data.get("incident_id"),
+            category=rca_data.get("category"),
+            object_ref=rca_data.get("remediation_target_name"),
+            action=rca_data.get("remediation_action", "subprocess"),
+            approved_by=user,
+            result="Success",
+            confidence_score=rca_data.get("confidence_score", 0),
+            detail=result_text,
+        )
+
+        success_blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"✅ Fix applied successfully! 🛠️\n*Result:*\n```\n{result_text}\n```"
+                }
+            }
+        ]
+
+        if rollback_data:
+            # Store rollback data and surface an Undo button in the success message
+            pending_rollbacks[incident_id] = rollback_data
+            rb = rollback_data
+            success_blocks.append({
+                "type": "actions",
+                "elements": [{
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "↩️ Undo this change"},
+                    "style": "danger",
+                    "value": incident_id,
+                    "action_id": "rollback_fix",
+                    "confirm": {
+                        "title": {"type": "plain_text", "text": "Undo the fix?"},
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"This will revert `{rb['container_name']}` in `{rb['target_name']}` back to `{rb['previous_image']}`."
+                        },
+                        "confirm": {"type": "plain_text", "text": "Yes, undo it"},
+                        "deny": {"type": "plain_text", "text": "Keep the fix"}
+                    }
+                }]
+            })
+
         app.client.chat_postMessage(
             channel=channel_id,
             thread_ts=message_ts,
-            text=f"✅ Fix applied successfully! 🛠️\n*Result:*\n```\n{result_text}\n```"
+            text="✅ Fix applied successfully!",
+            blocks=success_blocks
         )
     except subprocess.CalledProcessError as e:
+        log_activity(
+            incident_id=rca_data.get("incident_id"),
+            category=rca_data.get("category"),
+            object_ref=rca_data.get("remediation_target_name"),
+            action=rca_data.get("remediation_action", "subprocess"),
+            approved_by=user,
+            result="Failed",
+            detail=e.stderr.strip(),
+        )
         app.client.chat_postMessage(
             channel=channel_id,
             thread_ts=message_ts,
             text=f"❌ kubectl execution failed.\n*Error:*\n```\n{e.stderr.strip()}\n```"
         )
     except ApiException as e:
+        log_activity(
+            incident_id=rca_data.get("incident_id"),
+            category=rca_data.get("category"),
+            object_ref=rca_data.get("remediation_target_name"),
+            action=rca_data.get("remediation_action"),
+            approved_by=user,
+            result="Failed",
+            detail=f"HTTP {e.status}: {e.reason}",
+        )
         app.client.chat_postMessage(
             channel=channel_id,
             thread_ts=message_ts,
             text=f"❌ Kubernetes API rejected the action (HTTP {e.status}): {e.reason}"
         )
     except Exception as e:
+        log_activity(
+            incident_id=rca_data.get("incident_id") if rca_data else None,
+            category=rca_data.get("category") if rca_data else None,
+            object_ref=None,
+            action="unknown",
+            approved_by=user,
+            result="Failed",
+            detail=str(e),
+        )
         app.client.chat_postMessage(
             channel=channel_id,
             thread_ts=message_ts,
             text=f"❌ Remediation failed unexpectedly: {e}"
+        )
+
+@app.action("rollback_fix")
+def handle_rollback_fix(ack, body, logger):
+    ack()
+    user = body["user"]["id"]
+    incident_id = body["actions"][0]["value"]
+    channel_id = body["channel"]["id"]
+    message_ts = body["message"]["ts"]
+
+    # Same allowlist gate as approve
+    allowed = _load_allowed_approvers()
+    if allowed and user not in allowed:
+        app.client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=message_ts,
+            text=f"⛔ <@{user}> is not authorized to perform rollbacks."
+        )
+        return
+
+    rollback_data = pending_rollbacks.get(incident_id)
+    if not rollback_data:
+        app.client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=message_ts,
+            text="❌ No rollback data found. This change may have already been rolled back."
+        )
+        return
+
+    # Lock the undo button immediately to prevent double-execution
+    try:
+        original_blocks = body["message"]["blocks"]
+        updated_blocks = [b for b in original_blocks if b.get("type") != "actions"]
+        updated_blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"↩️ *Rollback initiated by <@{user}>.*"}]
+        })
+        app.client.chat_update(
+            channel=channel_id,
+            ts=message_ts,
+            text=body["message"].get("text", "K8s rollback"),
+            blocks=updated_blocks
+        )
+    except Exception as e:
+        logger.warning(f"Could not lock rollback button: {e}")
+
+    action = rollback_data.get("action")
+    target_name = rollback_data.get("target_name")
+    target_ns = rollback_data.get("target_namespace")
+    container_name = rollback_data.get("container_name")
+    previous_image = rollback_data.get("previous_image")
+
+    app.client.chat_postMessage(
+        channel=channel_id,
+        thread_ts=message_ts,
+        text=f"↩️ <@{user}> initiated rollback. Reverting `{container_name}` to `{previous_image}`..."
+    )
+
+    try:
+        patch = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{"name": container_name, "image": previous_image}]
+                    }
+                }
+            }
+        }
+        agent_instance.apps_v1.patch_namespaced_deployment(
+            name=target_name, namespace=target_ns, body=patch
+        )
+
+        pending_rollbacks.pop(incident_id, None)
+
+        log_activity(
+            incident_id=incident_id,
+            category="Rollback",
+            object_ref=f"Deployment/{target_name} in {target_ns}",
+            action="set_image_rollback",
+            approved_by=user,
+            result="Success",
+            detail=f"Reverted `{container_name}` to `{previous_image}`",
+        )
+        app.client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=message_ts,
+            text=f"✅ Rollback complete. `{container_name}` in `{target_name}` reverted to `{previous_image}`."
+        )
+    except ApiException as e:
+        app.client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=message_ts,
+            text=f"❌ Rollback failed (HTTP {e.status}): {e.reason}"
+        )
+    except Exception as e:
+        app.client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=message_ts,
+            text=f"❌ Rollback failed unexpectedly: {e}"
         )
 
 @app.action("forward_message")
@@ -311,6 +490,9 @@ class RCAAgent:
                 self.handle_error_event(event_obj)
 
     def run(self):
+        init_db()
+        start_dashboard(agent=self)
+
         watcher_thread = threading.Thread(target=self.run_watcher)
         watcher_thread.daemon = True
         watcher_thread.start()
@@ -335,13 +517,15 @@ class RCAAgent:
             self.hourly_alerts = 0
             self.hourly_reset_time = now + timedelta(hours=1)
 
-        if self.hourly_alerts >= 10:
-            logger.warning("Global K8gent RCA rate limit hit (10/hr). Dropping event to save tokens.")
+        hourly_limit = get_setting("hourly_alert_limit", 10)
+        if self.hourly_alerts >= hourly_limit:
+            logger.warning(f"Global K8gent RCA rate limit hit ({hourly_limit}/hr). Dropping event to save tokens.")
             return
 
+        debounce_mins = get_setting("debounce_minutes", 15)
         if cache_key in self.alert_cache:
             last_alerted = self.alert_cache[cache_key]
-            if now < last_alerted + timedelta(minutes=15):
+            if now < last_alerted + timedelta(minutes=debounce_mins):
                 logger.debug(f"Event {cache_key} debounced. Skipping LLM call.")
                 return
 
@@ -356,6 +540,16 @@ class RCAAgent:
 
         rca_result = self.generate_rca(reason, message, context, involved_object)
         self.send_slack_notification(rca_result, involved_object)
+
+        rca_data = rca_result.get("rca_data", {})
+        log_activity(
+            incident_id=rca_data.get("incident_id"),
+            category=rca_data.get("category"),
+            object_ref=rca_result.get("object_ref"),
+            action="RCA Generated",
+            result="Escalated" if rca_data.get("escalation_required") else "Pending",
+            confidence_score=rca_data.get("confidence_score", 0),
+        )
 
     def _get_owner_deployment(self, pod_name, namespace):
         """Traverse Pod → ReplicaSet → Deployment to find the managing Deployment name.
@@ -416,54 +610,23 @@ class RCAAgent:
     def generate_rca(self, reason, message, context, involved_object):
         truncated_context = context[:5000] if len(context) > 5000 else context
 
-        prompt = f"""
-You are a Senior Site Reliability Engineer (SRE) with Kubernetes credentials (CKA, CKS) specialized in Automated Root Cause Analysis (RCA). Your task is to analyze raw system logs, identify the underlying failure, and provide a remediation plan.
-
-Input Context:
-Reason: {reason}
-Message: {message}
-Involved Object: {involved_object.kind}/{involved_object.name}
-Namespace: {involved_object.namespace}
-Logs/Events:
-{truncated_context}
-
-Environment: Kubernetes Cluster (Production)
-
-Analysis Requirements:
-Categorization: Classify the error (e.g., OOMKilled, CrashLoopBackOff, Connectivity/DNS, Database Deadlock, Secret/Config Missing).
-Root Cause: Explain why the error occurred based strictly on the log patterns. IMPORTANT: Wrap any `kubectl` commands, object names, or variables in backticks so they are highlighted in Slack.
-Suggested Fix: Provide a step-by-step technical resolution. IMPORTANT: Wrap any inline `kubectl` commands, file paths, or variable names in backticks for readability.
-Kubectl Command: If applicable, formulate a single exact, executable shell `kubectl` command that cleanly remedies the issue. CRITICAL RULES: (1) You MUST always include the `-n {involved_object.namespace}` namespace flag. (2) ALWAYS prefer simple high-level subcommands: use `kubectl set image` for image issues, `kubectl delete pod` for crash loops, `kubectl rollout restart` for config reloads. (3) NEVER use `kubectl patch` with JSON arrays or --type=json. (4) If the fix requires ANY manual human steps first (creating secrets, editing YAML, typing passwords), leave this field completely empty.
-Confidence Score: Assign a percentage (0-100) indicating your certainty in the fix.
-Crucial: If your Confidence Score is less than 75, you must set escalation_required to true.
-
-Structured Remediation Fields (for automated API execution — fill these in alongside the kubectl_command):
-- remediation_action: Choose exactly one: "delete_pod" (for CrashLoopBackOff — delete the pod and let K8s recreate it), "set_image" (for ErrImagePull or wrong image tag), "rollout_restart" (for config/env reload), or "none" (if the fix requires manual human steps or you have low confidence).
-- remediation_target_name: The exact name of the resource to act on. Use the pod name for "delete_pod". Use the OWNER DEPLOYMENT name from context (not the pod name) for "set_image" and "rollout_restart".
-- remediation_target_namespace: Must always be "{involved_object.namespace}".
-- remediation_container_name: The container name to update (from POD CONTAINER NAMES in context). Only for "set_image"; empty string otherwise.
-- remediation_new_image: The corrected image:tag to apply. Only for "set_image"; empty string otherwise. Choose a stable public tag (e.g., "nginx:stable").
-
-Output Format (Strict JSON):
-{{
-  "incident_id": "RCA-XXXX",
-  "category": "String",
-  "root_cause": "String",
-  "suggested_fix": "String",
-  "kubectl_command": "String",
-  "remediation_action": "delete_pod | set_image | rollout_restart | none",
-  "remediation_target_name": "String",
-  "remediation_target_namespace": "String",
-  "remediation_container_name": "String",
-  "remediation_new_image": "String",
-  "confidence_score": 0,
-  "escalation_required": false
-}}
-"""
+        _prompt_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "prompts", "rca_analysis.txt"
+        )
+        with open(_prompt_path) as f:
+            prompt = Template(f.read()).substitute(
+                reason=reason,
+                message=message,
+                kind=involved_object.kind,
+                name=involved_object.name,
+                namespace=involved_object.namespace,
+                context=truncated_context,
+            )
 
         try:
             response = self.ai_client.models.generate_content(
-                model=self.ai_model,
+                model=get_setting("ai_model", self.ai_model),
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     system_instruction="You are an expert Kubernetes AI assistant. Always return ONLY valid JSON.",
@@ -517,13 +680,29 @@ Output Format (Strict JSON):
 
         if action == "delete_pod":
             self.v1.delete_namespaced_pod(name=target_name, namespace=target_ns)
-            return f"Deleted pod `{target_name}` in `{target_ns}`. Kubernetes will recreate it from its controller."
+            # Not reversible: Kubernetes immediately recreates the pod from its controller
+            return (
+                f"Deleted pod `{target_name}` in `{target_ns}`. Kubernetes will recreate it from its controller.",
+                None
+            )
 
         elif action == "set_image":
             container_name = rca_data.get("remediation_container_name", "")
             new_image = rca_data.get("remediation_new_image", "")
             if not container_name or not new_image:
                 raise ValueError("set_image requires both remediation_container_name and remediation_new_image.")
+
+            # Read the current image before patching so we can offer a rollback
+            previous_image = None
+            try:
+                dep = self.apps_v1.read_namespaced_deployment(name=target_name, namespace=target_ns)
+                for c in (dep.spec.template.spec.containers or []):
+                    if c.name == container_name:
+                        previous_image = c.image
+                        break
+            except ApiException:
+                pass  # Best-effort; rollback button simply won't appear if this fails
+
             patch = {
                 "spec": {
                     "template": {
@@ -535,7 +714,19 @@ Output Format (Strict JSON):
                 }
             }
             self.apps_v1.patch_namespaced_deployment(name=target_name, namespace=target_ns, body=patch)
-            return f"Updated container `{container_name}` in deployment `{target_name}` to image `{new_image}`."
+
+            rollback_data = {
+                "action": "set_image",
+                "target_name": target_name,
+                "target_namespace": target_ns,
+                "container_name": container_name,
+                "previous_image": previous_image,
+            } if previous_image else None
+
+            return (
+                f"Updated container `{container_name}` in deployment `{target_name}` to image `{new_image}`.",
+                rollback_data
+            )
 
         elif action == "rollout_restart":
             # Mirrors what `kubectl rollout restart` does internally
@@ -552,7 +743,11 @@ Output Format (Strict JSON):
                 }
             }
             self.apps_v1.patch_namespaced_deployment(name=target_name, namespace=target_ns, body=patch)
-            return f"Triggered rolling restart of deployment `{target_name}` in `{target_ns}`."
+            # Not meaningfully reversible: restart doesn't change configuration
+            return (
+                f"Triggered rolling restart of deployment `{target_name}` in `{target_ns}`.",
+                None
+            )
 
         else:
             raise ValueError(f"Unsupported remediation action: '{action}'. Manual intervention required.")
