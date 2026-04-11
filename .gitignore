@@ -134,6 +134,9 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# K8gentS local config — never commit these
+approvers.local
+
 # Environments
 .env
 .envrc

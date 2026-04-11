@@ -38,6 +38,17 @@ spec:
               value: "all"
             - name: LOG_LEVEL
               value: "INFO"
+            # "api" uses the Kubernetes Python client (safe in-cluster, default).
+            # "subprocess" shells out to kubectl (local dev only).
+            - name: REMEDIATION_MODE
+              value: "api"
+            # Comma-separated Slack user IDs allowed to click "Approve Fix".
+            # Value is injected from k8gent-secrets at deploy time — never hardcoded here.
+            - name: ALLOWED_APPROVERS
+              valueFrom:
+                secretKeyRef:
+                  name: k8gent-secrets
+                  key: ALLOWED_APPROVERS
             - name: AI_API_KEY
               valueFrom:
                 secretKeyRef:

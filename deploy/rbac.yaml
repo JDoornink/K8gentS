@@ -4,13 +4,12 @@ metadata:
   name: k8gent-sa
   namespace: k8gent-system
 ---
+# Read-only role: always applied. The agent can observe the cluster but cannot mutate it.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: k8gent-readonly-role
 rules:
-  # The Agent is strictly read-only by default.
-  # Permission to view pods, namespaces, nodes, events, services, etc.
   - apiGroups: [""]
     resources:
       - pods
@@ -23,7 +22,7 @@ rules:
       - persistentvolumes
       - persistentvolumeclaims
       - configmaps
-      - secrets # Caution: Needed for deep RCA (e.g., verifying secret existence), can remove if too broad
+      - secrets # Needed for deep RCA (e.g., verifying secret existence). Remove if too broad.
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources:
@@ -54,4 +53,39 @@ subjects:
 roleRef:
   kind: ClusterRole
   name: k8gent-readonly-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# Remediation role: opt-in. Apply this only when REMEDIATION_MODE=api is enabled.
+# Scoped to the minimum verbs needed for the three supported remediation actions:
+#   - delete_pod:       delete on pods
+#   - set_image:        patch on deployments
+#   - rollout_restart:  patch on deployments
+# Intentionally excludes: namespaces, secrets, daemonsets, statefulsets, and all delete on deployments.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8gent-remediation-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["patch"]
+---
+# To enable automated remediation, apply this binding:
+#   kubectl apply -f deploy/rbac.yaml
+# To revoke it without touching the read-only role:
+#   kubectl delete clusterrolebinding k8gent-remediation-binding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8gent-remediation-binding
+subjects:
+  - kind: ServiceAccount
+    name: k8gent-sa
+    namespace: k8gent-system
+roleRef:
+  kind: ClusterRole
+  name: k8gent-remediation-role
   apiGroup: rbac.authorization.k8s.io
