@@ -58,6 +58,7 @@ When asked to continue or work on this project, the AI should:
 - **Activity Log** (`/`): SQLite-backed event table with live cluster status resolution (Pending → Resolved) and 30-second auto-refresh.
 - **Cluster Info** (`/cluster`): active context, connection health, watch scope, pod counts by namespace.
 - **Settings** (`/settings`): live editor for AI model, remediation mode, rate limits, debounce window. Persists to `data/settings.json`.
+- **Debounce deduplication (pod replacement):** Debounce cache now keys on the owning Deployment name (not the ephemeral pod name) for Deployment-managed pods. Prevents duplicate alerts when Kubernetes replaces a crashlooping pod with a new generated name.
 
 ---
 
@@ -101,3 +102,34 @@ Currently the agent only processes pod-level `Warning` events. Expand to cover:
 ### RBAC & Auth Failures (not yet monitored)
 - `Forbidden` on API calls — ServiceAccount missing Role/ClusterRole binding.
 - `Unauthorized` — expired or missing credentials for external services.
+
+---
+
+## 🔮 Phase 5: Security Hardening
+
+### OPA / Kyverno Admission Policy Layer (Priority: High)
+Even with the short-lived Job executor pattern in place, the `k8gent-executor-sa` service account holds
+cluster-wide `delete` (pods) and `patch` (deployments) verbs. An OPA Gatekeeper or Kyverno admission
+policy layer would enforce *what* can actually be mutated — independent of RBAC.
+
+Goals:
+- Allow only `patch` on `deployments`, never on `daemonsets`, `statefulsets`, or `namespaces`.
+- Restrict `delete` to pods only, never to controllers or cluster-scoped resources.
+- Scope allowed mutations to a configurable set of namespaces (e.g. exclude `kube-system`).
+- Block any mutation that would change `serviceAccountName` or add `hostPID`/`hostNetwork`.
+- Log all policy decisions to a dedicated audit sink.
+
+This layer sits in front of the Kubernetes API server and enforces constraints even if RBAC is
+misconfigured or overly broad. No Python code changes required — deploy a `ConstraintTemplate`
+(OPA) or `ClusterPolicy` (Kyverno) manifest.
+
+### Remaining Duplicate-Alert Gaps (Priority: Medium)
+The following deduplication gaps still exist after the pod-replacement fix:
+
+| Gap | Root Cause | Suggested Fix |
+|---|---|---|
+| Agent restart clears cache | `alert_cache` is in-memory only | Re-hydrate from recent SQLite activity log on startup |
+| Hourly rate limiter also in-memory | `hourly_alerts` resets on restart | Persist count + reset timestamp to `data/settings.json` or SQLite |
+| No idempotency key in Slack | Two calls to `send_slack_notification` produce two unlinked messages | Pass `incident_id` as Slack metadata; use `chat_update` if a message for that ID already exists |
+| Cache not thread-safe | Plain `dict` with no lock; safe under CPython GIL but not guaranteed | Wrap `alert_cache` reads/writes with `threading.Lock` |
+| `pending_fixes` has no TTL | Approvals clicked hours after an alert still execute the original fix | Store a `created_at` timestamp with each entry; reject approvals older than a configurable window (e.g. 30 min) |

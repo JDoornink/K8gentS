@@ -24,6 +24,7 @@ def agent():
          patch('main.config.load_kube_config'), \
          patch('main.client.CoreV1Api'), \
          patch('main.client.AppsV1Api'), \
+         patch('main.client.BatchV1Api'), \
          patch('main.genai.Client'):
         return RCAAgent()
 

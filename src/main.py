@@ -5,6 +5,7 @@ import json
 import uuid
 import subprocess
 from datetime import datetime, timedelta
+import time
 from string import Template
 from dashboard import init_db, start_dashboard, log_activity, get_setting
 from kubernetes import client, config, watch
@@ -14,6 +15,9 @@ from google.genai import types
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 import threading
+
+# The namespace this agent is deployed into — used when spawning executor Jobs.
+_AGENT_NAMESPACE = os.environ.get("AGENT_NAMESPACE", "k8gent-system")
 
 # Secure in-memory store: maps incident_id → full rca_data dict.
 # Decouples LLM generation from asynchronous human approval.
@@ -63,6 +67,18 @@ def _load_allowed_approvers():
         return {u.strip() for u in raw.split(",") if u.strip()}
 
     return set()
+
+
+def _get_slack_display_name(user_id: str) -> str:
+    """Resolve a Slack user ID to a human-readable display name.
+    Falls back to the raw user ID if the API call fails (e.g. missing users:read scope)."""
+    try:
+        info = app.client.users_info(user=user_id)
+        profile = info["user"]["profile"]
+        return profile.get("display_name") or profile.get("real_name") or user_id
+    except Exception:
+        return user_id
+
 
 # Initialize Slack App
 app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
@@ -147,10 +163,10 @@ def handle_approve_fix(ack, body, logger):
         log_activity(
             incident_id=rca_data.get("incident_id"),
             category=rca_data.get("category"),
-            object_ref=rca_data.get("remediation_target_name"),
+            object_ref=rca_data.get("_object_ref") or rca_data.get("remediation_target_name"),
             action=rca_data.get("remediation_action", "subprocess"),
-            approved_by=user,
-            result="Success",
+            approved_by=_get_slack_display_name(user),
+            result="Fix Applied",
             confidence_score=rca_data.get("confidence_score", 0),
             detail=result_text,
         )
@@ -298,18 +314,16 @@ def handle_rollback_fix(ack, body, logger):
     )
 
     try:
-        patch = {
-            "spec": {
-                "template": {
-                    "spec": {
-                        "containers": [{"name": container_name, "image": previous_image}]
-                    }
-                }
-            }
-        }
-        agent_instance.apps_v1.patch_namespaced_deployment(
-            name=target_name, namespace=target_ns, body=patch
-        )
+        # Spawn an executor Job for the rollback — same security model as the original fix.
+        # The main agent SA never holds write permissions directly.
+        agent_instance.execute_remediation_api({
+            "incident_id": f"{incident_id}-rollback",
+            "remediation_action": "set_image",
+            "remediation_target_name": target_name,
+            "remediation_target_namespace": target_ns,
+            "remediation_container_name": container_name,
+            "remediation_new_image": previous_image,
+        })
 
         pending_rollbacks.pop(incident_id, None)
 
@@ -318,8 +332,8 @@ def handle_rollback_fix(ack, body, logger):
             category="Rollback",
             object_ref=f"Deployment/{target_name} in {target_ns}",
             action="set_image_rollback",
-            approved_by=user,
-            result="Success",
+            approved_by=_get_slack_display_name(user),
+            result="Rolled Back",
             detail=f"Reverted `{container_name}` to `{previous_image}`",
         )
         app.client.chat_postMessage(
@@ -417,6 +431,20 @@ def handle_forward_submit(ack, body, view, logger):
             thread_ts=meta["message_ts"],
             text=report_text
         )
+
+        # Look up the originating rca_data if still in memory
+        unique_id = meta.get("incident_id", "")
+        rca_data = pending_fixes.get(unique_id, {})
+        log_activity(
+            incident_id=rca_data.get("incident_id", unique_id),
+            category=rca_data.get("category"),
+            object_ref=rca_data.get("_object_ref") or rca_data.get("remediation_target_name"),
+            action="forward",
+            approved_by=_get_slack_display_name(user_who_forwarded),
+            result="Forwarded",
+            confidence_score=rca_data.get("confidence_score", 0),
+            detail=report_text,
+        )
     except Exception as e:
         logger.error(f"Failed to process forward request: {e}")
 
@@ -424,6 +452,8 @@ def handle_forward_submit(ack, body, view, logger):
 def handle_disregard_alert(ack, body, logger):
     ack()
     user = body["user"]["id"]
+    incident_id = body["actions"][0]["value"]
+    display_name = _get_slack_display_name(user)
 
     try:
         original_blocks = body["message"]["blocks"]
@@ -441,10 +471,23 @@ def handle_disregard_alert(ack, body, logger):
     except Exception as e:
         logger.warning(f"Could not update message blocks to remove buttons: {e}")
 
+    # Consume the pending fix so it can't be approved after disregard
+    rca_data = pending_fixes.pop(incident_id, {})
+
     app.client.chat_postMessage(
         channel=body["channel"]["id"],
         thread_ts=body["message"]["ts"],
         text=f"<@{user}> Disregarded the alert. Agent will stand down."
+    )
+
+    log_activity(
+        incident_id=rca_data.get("incident_id", incident_id),
+        category=rca_data.get("category"),
+        object_ref=rca_data.get("_object_ref") or rca_data.get("remediation_target_name"),
+        action="disregard",
+        approved_by=display_name,
+        result="Disregarded",
+        confidence_score=rca_data.get("confidence_score", 0),
     )
 
 
@@ -459,6 +502,7 @@ class RCAAgent:
 
         self.v1 = client.CoreV1Api()
         self.apps_v1 = client.AppsV1Api()
+        self.batch_v1 = client.BatchV1Api()
 
         self.ai_client = genai.Client(api_key=os.environ.get("AI_API_KEY"))
         self.ai_model = os.environ.get("AI_MODEL", "gemini-2.5-pro")
@@ -509,7 +553,19 @@ class RCAAgent:
         if reason in ["FailedScheduling", "Unhealthy"]:
             return
 
-        cache_key = f"{namespace}/{involved_object.kind}/{involved_object.name}:{reason}"
+        # For Deployment-managed pods, key on the Deployment name rather than the
+        # individual pod name. This prevents duplicate alerts when a crashlooping pod
+        # is replaced by Kubernetes with a new generated name (e.g. my-app-xk2p9 →
+        # my-app-mn4r1) — both belong to the same root cause and should share the
+        # same debounce window.
+        if involved_object.kind == "Pod":
+            deployment_name = self._get_owner_deployment(involved_object.name, namespace)
+            if deployment_name:
+                cache_key = f"{namespace}/Deployment/{deployment_name}:{reason}"
+            else:
+                cache_key = f"{namespace}/Pod/{involved_object.name}:{reason}"
+        else:
+            cache_key = f"{namespace}/{involved_object.kind}/{involved_object.name}:{reason}"
 
         now = datetime.now()
 
@@ -614,7 +670,7 @@ class RCAAgent:
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "prompts", "rca_analysis.txt"
         )
-        with open(_prompt_path) as f:
+        with open(_prompt_path, encoding="utf-8") as f:
             prompt = Template(f.read()).substitute(
                 reason=reason,
                 message=message,
@@ -669,30 +725,43 @@ class RCAAgent:
         }
 
     def execute_remediation_api(self, rca_data):
-        """Execute remediation using the Kubernetes Python client.
-        Safe for in-cluster use — no subprocess, no shell, no kubeconfig file needed."""
+        """Spawn a short-lived Kubernetes Job using k8gent-executor-sa to apply the fix.
+
+        Security model:
+          - The main agent SA (k8gent-sa) is permanently read-only.
+          - Write permissions (delete/patch) are held ONLY by k8gent-executor-sa,
+            which runs exclusively inside ephemeral Job pods.
+          - Each Job lives for ~5-30 seconds, then exits. Kubernetes auto-deletes
+            it 2 minutes later via ttlSecondsAfterFinished.
+          - backoff_limit=0 prevents silent retries; a failed remediation requires
+            a fresh human approval cycle.
+        """
         action = rca_data.get("remediation_action", "none")
         target_name = rca_data.get("remediation_target_name", "")
         target_ns = rca_data.get("remediation_target_namespace", "default")
+        incident_id = rca_data.get("incident_id", uuid.uuid4().hex)
 
         if not target_name:
             raise ValueError(f"No remediation_target_name provided for action '{action}'.")
 
+        rollback_data = None
+
         if action == "delete_pod":
-            self.v1.delete_namespaced_pod(name=target_name, namespace=target_ns)
-            # Not reversible: Kubernetes immediately recreates the pod from its controller
-            return (
-                f"Deleted pod `{target_name}` in `{target_ns}`. Kubernetes will recreate it from its controller.",
-                None
+            command = ["kubectl", "delete", "pod", target_name, "-n", target_ns]
+            result_text = (
+                f"Deleted pod `{target_name}` in `{target_ns}`. "
+                f"Kubernetes will recreate it from its controller."
             )
 
         elif action == "set_image":
             container_name = rca_data.get("remediation_container_name", "")
             new_image = rca_data.get("remediation_new_image", "")
             if not container_name or not new_image:
-                raise ValueError("set_image requires both remediation_container_name and remediation_new_image.")
+                raise ValueError(
+                    "set_image requires both remediation_container_name and remediation_new_image."
+                )
 
-            # Read the current image before patching so we can offer a rollback
+            # Capture current image for rollback using read-only access — before the Job mutates anything.
             previous_image = None
             try:
                 dep = self.apps_v1.read_namespaced_deployment(name=target_name, namespace=target_ns)
@@ -703,54 +772,114 @@ class RCAAgent:
             except ApiException:
                 pass  # Best-effort; rollback button simply won't appear if this fails
 
-            patch = {
-                "spec": {
-                    "template": {
-                        "spec": {
-                            # Strategic merge patch: merges by container name, leaving other containers untouched
-                            "containers": [{"name": container_name, "image": new_image}]
-                        }
-                    }
-                }
-            }
-            self.apps_v1.patch_namespaced_deployment(name=target_name, namespace=target_ns, body=patch)
-
-            rollback_data = {
-                "action": "set_image",
-                "target_name": target_name,
-                "target_namespace": target_ns,
-                "container_name": container_name,
-                "previous_image": previous_image,
-            } if previous_image else None
-
-            return (
-                f"Updated container `{container_name}` in deployment `{target_name}` to image `{new_image}`.",
-                rollback_data
+            command = [
+                "kubectl", "set", "image",
+                f"deployment/{target_name}",
+                f"{container_name}={new_image}",
+                "-n", target_ns,
+            ]
+            result_text = (
+                f"Updated container `{container_name}` in deployment "
+                f"`{target_name}` to image `{new_image}`."
             )
+            if previous_image:
+                rollback_data = {
+                    "action": "set_image",
+                    "target_name": target_name,
+                    "target_namespace": target_ns,
+                    "container_name": container_name,
+                    "previous_image": previous_image,
+                }
 
         elif action == "rollout_restart":
-            # Mirrors what `kubectl rollout restart` does internally
-            now = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-            patch = {
-                "spec": {
-                    "template": {
-                        "metadata": {
-                            "annotations": {
-                                "kubectl.kubernetes.io/restartedAt": now
-                            }
-                        }
-                    }
-                }
-            }
-            self.apps_v1.patch_namespaced_deployment(name=target_name, namespace=target_ns, body=patch)
-            # Not meaningfully reversible: restart doesn't change configuration
-            return (
-                f"Triggered rolling restart of deployment `{target_name}` in `{target_ns}`.",
-                None
+            command = [
+                "kubectl", "rollout", "restart",
+                f"deployment/{target_name}",
+                "-n", target_ns,
+            ]
+            result_text = (
+                f"Triggered rolling restart of deployment `{target_name}` in `{target_ns}`."
             )
 
         else:
-            raise ValueError(f"Unsupported remediation action: '{action}'. Manual intervention required.")
+            raise ValueError(
+                f"Unsupported remediation action: '{action}'. Manual intervention required."
+            )
+
+        self._run_executor_job(command, incident_id)
+        return result_text, rollback_data
+
+    def _run_executor_job(self, command, incident_id, timeout=90):
+        """Create a short-lived Job using k8gent-executor-sa and block until it finishes.
+
+        The Job pod is the ONLY principal that ever holds write verbs against the cluster.
+        It auto-deletes 120 seconds after completion via ttlSecondsAfterFinished.
+        """
+        # Build a DNS-safe job name from the incident ID
+        safe_id = re.sub(r'[^a-z0-9]', '-', incident_id.lower())[:20].strip('-')
+        job_name = f"k8gent-fix-{safe_id}-{int(time.time())}"
+
+        job = client.V1Job(
+            metadata=client.V1ObjectMeta(
+                name=job_name,
+                namespace=_AGENT_NAMESPACE,
+                labels={"app": "k8gent", "incident-id": safe_id},
+            ),
+            spec=client.V1JobSpec(
+                ttl_seconds_after_finished=120,
+                backoff_limit=0,  # No retries — failed remediations require fresh human approval
+                template=client.V1PodTemplateSpec(
+                    metadata=client.V1ObjectMeta(
+                        labels={"app": "k8gent-executor"}
+                    ),
+                    spec=client.V1PodSpec(
+                        service_account_name="k8gent-executor-sa",
+                        restart_policy="Never",
+                        security_context=client.V1PodSecurityContext(
+                            run_as_non_root=True,
+                            run_as_user=1000,
+                            run_as_group=3000,
+                        ),
+                        containers=[
+                            client.V1Container(
+                                name="executor",
+                                image="bitnami/kubectl:latest",
+                                command=command,
+                                security_context=client.V1SecurityContext(
+                                    allow_privilege_escalation=False,
+                                    read_only_root_filesystem=True,
+                                    capabilities=client.V1Capabilities(drop=["ALL"]),
+                                ),
+                            )
+                        ],
+                    ),
+                ),
+            ),
+        )
+
+        self.batch_v1.create_namespaced_job(namespace=_AGENT_NAMESPACE, body=job)
+        logger.info(f"Spawned remediation Job '{job_name}' for incident '{incident_id}'")
+
+        # Poll until complete or timeout
+        interval, elapsed = 3, 0
+        while elapsed < timeout:
+            status = self.batch_v1.read_namespaced_job(
+                name=job_name, namespace=_AGENT_NAMESPACE
+            ).status
+            if status.succeeded:
+                logger.info(f"Remediation Job '{job_name}' completed successfully.")
+                return
+            if status.failed:
+                raise RuntimeError(
+                    f"Remediation Job '{job_name}' failed. "
+                    f"Inspect logs: kubectl logs -n {_AGENT_NAMESPACE} -l incident-id={safe_id}"
+                )
+            time.sleep(interval)
+            elapsed += interval
+
+        raise TimeoutError(
+            f"Remediation Job '{job_name}' did not complete within {timeout}s."
+        )
 
     def send_slack_notification(self, rca_result, involved_object):
         if not os.environ.get("SLACK_CHANNEL_ID"):
@@ -799,6 +928,9 @@ class RCAAgent:
 
         # Store the full rca_data dict so handle_approve_fix can dispatch by mode
         unique_incident_id = str(uuid.uuid4())
+        # Inject the human-readable object ref so action handlers can log it correctly.
+        # remediation_target_name is often empty for non-remediable events (e.g. config issues).
+        rca_data["_object_ref"] = object_ref
         pending_fixes[unique_incident_id] = rca_data
 
         # Determine if the agent can offer automated remediation
@@ -836,7 +968,7 @@ class RCAAgent:
             {
                 "type": "button",
                 "text": {"type": "plain_text", "text": "Disregard"},
-                "value": "cancel",
+                "value": unique_incident_id,
                 "action_id": "disregard_alert"
             }
         ])

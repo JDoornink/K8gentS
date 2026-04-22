@@ -4,7 +4,18 @@ metadata:
   name: k8gent-sa
   namespace: k8gent-system
 ---
-# Read-only role: always applied. The agent can observe the cluster but cannot mutate it.
+# ─── Executor Service Account ──────────────────────────────────────────────────
+# This SA is used exclusively by short-lived remediation Jobs, NOT by the agent pod.
+# Write permissions (delete pods, patch deployments) live here and nowhere else.
+# The Job pod exists for ~5-30 seconds, then exits. ttlSecondsAfterFinished cleans it up.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8gent-executor-sa
+  namespace: k8gent-system
+---
+# ─── Read-Only Role ────────────────────────────────────────────────────────────
+# Always applied. The agent pod can observe the cluster but cannot mutate anything.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -34,7 +45,6 @@ rules:
   - apiGroups: ["batch"]
     resources:
       - jobs
-      - cronjobs
     verbs: ["get", "list", "watch"]
   - apiGroups: ["networking.k8s.io"]
     resources:
@@ -55,12 +65,40 @@ roleRef:
   name: k8gent-readonly-role
   apiGroup: rbac.authorization.k8s.io
 ---
-# Remediation role: opt-in. Apply this only when REMEDIATION_MODE=api is enabled.
+# ─── Job Creator Role ──────────────────────────────────────────────────────────
+# Namespaced (not cluster-wide): agent can only spawn Jobs inside k8gent-system.
+# This is the only write permission the agent pod itself ever holds.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k8gent-job-creator-role
+  namespace: k8gent-system
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k8gent-job-creator-binding
+  namespace: k8gent-system
+subjects:
+  - kind: ServiceAccount
+    name: k8gent-sa
+    namespace: k8gent-system
+roleRef:
+  kind: Role
+  name: k8gent-job-creator-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# ─── Remediation Role ──────────────────────────────────────────────────────────
 # Scoped to the minimum verbs needed for the three supported remediation actions:
 #   - delete_pod:       delete on pods
 #   - set_image:        patch on deployments
 #   - rollout_restart:  patch on deployments
-# Intentionally excludes: namespaces, secrets, daemonsets, statefulsets, and all delete on deployments.
+# Intentionally excludes: namespaces, secrets, daemonsets, statefulsets, and all
+# delete on deployments. Bound to k8gent-executor-sa ONLY — never to k8gent-sa.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -73,9 +111,8 @@ rules:
     resources: ["deployments"]
     verbs: ["patch"]
 ---
-# To enable automated remediation, apply this binding:
-#   kubectl apply -f deploy/rbac.yaml
-# To revoke it without touching the read-only role:
+# Bound to the executor SA — the write-capable identity used only inside Job pods.
+# To fully disable remediation without code changes:
 #   kubectl delete clusterrolebinding k8gent-remediation-binding
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -83,7 +120,7 @@ metadata:
   name: k8gent-remediation-binding
 subjects:
   - kind: ServiceAccount
-    name: k8gent-sa
+    name: k8gent-executor-sa   # <-- executor SA, NOT the main agent SA
     namespace: k8gent-system
 roleRef:
   kind: ClusterRole

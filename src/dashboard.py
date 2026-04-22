@@ -239,6 +239,8 @@ _BASE = """<!DOCTYPE html>
     .fail     { color: #dc3545; font-weight: 600; }
     .esc      { color: #6f42c1; font-weight: 600; }
     .pend     { color: #fd7e14; font-weight: 600; }
+    .disregard { color: #6c757d; font-weight: 600; }
+    .fwd      { color: #0dcaf0; font-weight: 600; }
     .table td, .table th { vertical-align: middle; }
   </style>
 </head>
@@ -300,8 +302,16 @@ _ACTIVITY = _BASE.replace("{% block content %}{% endblock %}", """
             <td class="small">{{ r.action or '—' }}</td>
             <td class="small">{{ r.approved_by or '—' }}</td>
             <td class="text-nowrap">
-              {% if r.result == 'Success' %}
+              {% if r.result == 'Fix Applied' %}
+                <span class="ok"><i class="bi bi-check-circle-fill"></i> Fix Applied</span>
+              {% elif r.result == 'Success' %}
                 <span class="ok"><i class="bi bi-check-circle"></i> Success</span>
+              {% elif r.result == 'Rolled Back' %}
+                <span class="resolved"><i class="bi bi-arrow-counterclockwise"></i> Rolled Back</span>
+              {% elif r.result == 'Disregarded' %}
+                <span class="disregard"><i class="bi bi-slash-circle"></i> Disregarded</span>
+              {% elif r.result == 'Forwarded' %}
+                <span class="fwd"><i class="bi bi-forward-fill"></i> Forwarded</span>
               {% elif r.result == 'Failed' %}
                 <span class="fail"><i class="bi bi-x-circle"></i> Failed</span>
               {% elif r.result == 'Escalated' %}
