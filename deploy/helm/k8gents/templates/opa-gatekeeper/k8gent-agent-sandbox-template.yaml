@@ -1,0 +1,87 @@
+{{- if .Values.sandbox.enabled }}
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8gentagentsandbox
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8gentAgentSandbox
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            targetServiceAccount:
+              type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8gentagentsandbox
+
+        # Only evaluate if the user is the target service account
+        is_target_sa {
+            input.review.userInfo.username == input.parameters.targetServiceAccount
+        }
+
+        # Block invalid kinds entirely
+        violation[{"msg": msg}] {
+            is_target_sa
+            kind := input.review.requestKind.kind
+            kind != "Pod"
+            kind != "Deployment"
+            msg := sprintf("Agent executor is not permitted to mutate resources of kind %v", [kind])
+        }
+
+        # Pod constraints (only allow DELETE)
+        violation[{"msg": msg}] {
+            is_target_sa
+            input.review.requestKind.kind == "Pod"
+            input.review.operation != "DELETE"
+            msg := sprintf("Agent executor is not permitted to perform %v on Pods", [input.review.operation])
+        }
+
+        # Deployment constraints (only allow UPDATE or PATCH)
+        violation[{"msg": msg}] {
+            is_target_sa
+            input.review.requestKind.kind == "Deployment"
+            input.review.operation != "UPDATE"
+            input.review.operation != "PATCH"
+            msg := sprintf("Agent executor is not permitted to perform %v on Deployments", [input.review.operation])
+        }
+
+        # Escapement: hostNetwork
+        violation[{"msg": msg}] {
+            is_target_sa
+            input.review.requestKind.kind == "Deployment"
+            input.review.object.spec.template.spec.hostNetwork == true
+            msg := "Agent executor cannot assign hostNetwork=true to Deployments"
+        }
+
+        # Escapement: hostPID
+        violation[{"msg": msg}] {
+            is_target_sa
+            input.review.requestKind.kind == "Deployment"
+            input.review.object.spec.template.spec.hostPID == true
+            msg := "Agent executor cannot assign hostPID=true to Deployments"
+        }
+
+        # Escapement: modify serviceAccountName
+        violation[{"msg": msg}] {
+            is_target_sa
+            input.review.requestKind.kind == "Deployment"
+            input.review.operation == "UPDATE"
+
+            old_sa := get_sa(input.review.oldObject)
+            new_sa := get_sa(input.review.object)
+            old_sa != new_sa
+
+            msg := sprintf("Agent executor cannot change serviceAccountName from '%v' to '%v'", [old_sa, new_sa])
+        }
+
+        get_sa(obj) = sa {
+            sa := obj.spec.template.spec.serviceAccountName
+        } else = "default" {
+            true
+        }
+{{- end }}

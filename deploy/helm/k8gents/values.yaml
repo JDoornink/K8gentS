@@ -1,0 +1,26 @@
+image:
+  repository: "jdoornink/k8gent-agent"
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+agent:
+  watchNamespaces: "all"
+  logLevel: "INFO"
+  remediationMode: "api"
+
+secrets:
+  # The tokens and API keys required for the agent logic to execute.
+  # Overwrite these in your secure CI/CD pipeline flags or local overrides (e.g., --set secrets.aiApiKey=XXX).
+  allowedApprovers: ""
+  aiApiKey: ""
+  slackBotToken: ""
+  slackAppToken: ""
+  slackChannelId: ""
+
+# Installs the OPA Gatekeeper cluster infrastructure natively.
+gatekeeper:
+  enabled: true
+
+# Deploys our custom OPA Rego rules to lock down the executor ServiceAccount.
+sandbox:
+  enabled: true

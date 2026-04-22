@@ -1,0 +1,18 @@
+{{- if .Values.sandbox.enabled }}
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8gentAgentSandbox
+metadata:
+  name: {{ include "k8gents.fullname" . }}-executor-boundaries
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["*"]
+        kinds: ["*"]
+    excludedNamespaces:
+      - "kube-system"
+      - "kube-public"
+      - "kube-node-lease"
+  parameters:
+    targetServiceAccount: "system:serviceaccount:{{ .Release.Namespace }}:{{ include "k8gents.fullname" . }}-executor-sa"
+{{- end }}
