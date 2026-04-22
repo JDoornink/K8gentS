@@ -1,0 +1,41 @@
+Phase 1: The "Build" (Infrastructure-to-AI Bridge)
+Target: 2–4 Hours
+
+[ ] Initialize MCP Server: Use the Python MCP SDK. (Python is preferred for SRE/ML cross-over).
+
+[ ] Define the "SRE Tools": Implement at least three specific JSON-RPC tools:
+
+inspect_k8s_events: Fetches recent warnings/errors from a specific namespace.
+
+get_pod_resource_delta: Compares current usage vs. limits to detect OOMKill trends.
+
+correlate_logs_with_alerts: Bridges Prometheus alert metadata with stdout logs.
+
+[ ] Implement "Human-in-the-Loop" (HITL): Since you’re an SRE, add a mandatory confirmation_required flag for any tool that suggests a "Fix" action (e.g., kubectl delete pod). This is a massive signal to Anthropic/Google that you care about AI Safety.
+
+Phase 2: The "Ecosystem" (Validation & Visibility)
+Target: 1 Hour (This makes it "Open Source")
+
+[ ] The "Official" PR: Fork modelcontextprotocol/servers and submit a simplified version of your server as a "reference implementation" for Kubernetes Diagnostics.
+
+[ ] Register on Smithery.ai: This is the current (2026) leading registry for MCP servers. Being listed here makes your tool "discoverable" by other engineers.
+
+[ ] "Glasswing" Alignment: In your README.md, explicitly tag your project with #ProjectGlasswing and #DefensiveAI. State that your tool is built to provide "observability context for frontier models during incident response."
+
+Phase 3: The "Google" Pivot
+Target: 2 Hours
+
+[ ] Port to Google ADK: Take your core RCA logic and wrap it as a "Skill" for the Google Agent Development Kit (ADK).
+
+[ ] GKE Specialization: Add one Google-specific tool, like inspect_gke_autopilot_events. This proves you understand Google Cloud’s managed Kubernetes nuances.
+
+Phase 4: The "Resume" (Converting Code to Cash)
+[ ] Rewrite your "Projects" section:
+
+Open Source Contributor | MCP & Project Glasswing (2026)
+
+Designed and launched an open-source MCP (Model Context Protocol) server for automated Kubernetes RCA, adopted by the community via Smithery.ai.
+
+Engineered "Agentic SRE" tools that reduced manual triage time by bridging Claude Mythos and Gemini 1.5/2.0 to live production clusters.
+
+Collaborated on the Google ADK ecosystem by contributing GKE-specific diagnostic skills for the April 2026 security initiative.
