@@ -1,0 +1,12 @@
+apiVersion: v2
+name: k8gents
+description: Autonomous Kubernetes RCA Agent
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+dependencies:
+  - name: gatekeeper
+    version: "3.14.0"
+    repository: https://open-policy-agent.github.io/gatekeeper/charts
+    condition: gatekeeper.enabled

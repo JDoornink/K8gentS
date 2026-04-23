@@ -1,22 +1,21 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: k8gent
-  namespace: k8gent-system
+  name: {{ include "k8gents.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
-    app: k8gent
+    app: {{ include "k8gents.fullname" . }}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: k8gent
+      app: {{ include "k8gents.fullname" . }}
   template:
     metadata:
       labels:
-        app: k8gent
+        app: {{ include "k8gents.fullname" . }}
     spec:
-      serviceAccountName: k8gent-sa
-      # Pod-level security context ensures the process cannot run as root
+      serviceAccountName: {{ include "k8gents.fullname" . }}-sa
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -24,9 +23,8 @@ spec:
         fsGroup: 2000
       containers:
         - name: agent
-          image: k8gent/agent:latest # Replace with actual published image
-          imagePullPolicy: IfNotPresent
-          # Container-level security context drops all Linux capabilities and prevents privilege escalation
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -34,40 +32,38 @@ spec:
               drop:
                 - ALL
           env:
+            - name: AGENT_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
             - name: WATCH_NAMESPACES
-              value: "all"
+              value: {{ .Values.agent.watchNamespaces | quote }}
             - name: LOG_LEVEL
-              value: "INFO"
-            # "api" uses the Kubernetes Python client (safe in-cluster, default).
-            # "subprocess" shells out to kubectl (local dev only).
+              value: {{ .Values.agent.logLevel | quote }}
             - name: REMEDIATION_MODE
-              value: "api"
-            # Comma-separated Slack user IDs allowed to click "Approve Fix".
-            # Value is injected from k8gent-secrets at deploy time — never hardcoded here.
+              value: {{ .Values.agent.remediationMode | quote }}
             - name: ALLOWED_APPROVERS
               valueFrom:
                 secretKeyRef:
-                  name: k8gent-secrets
+                  name: {{ include "k8gents.fullname" . }}-secrets
                   key: ALLOWED_APPROVERS
             - name: AI_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: k8gent-secrets
+                  name: {{ include "k8gents.fullname" . }}-secrets
                   key: AI_API_KEY
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: k8gent-secrets
+                  name: {{ include "k8gents.fullname" . }}-secrets
                   key: SLACK_BOT_TOKEN
             - name: SLACK_APP_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: k8gent-secrets
+                  name: {{ include "k8gents.fullname" . }}-secrets
                   key: SLACK_APP_TOKEN
             - name: SLACK_CHANNEL_ID
               valueFrom:
                 secretKeyRef:
-                  name: k8gent-secrets
+                  name: {{ include "k8gents.fullname" . }}-secrets
                   key: SLACK_CHANNEL_ID
           resources:
             requests:
