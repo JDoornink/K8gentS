@@ -6,7 +6,7 @@
 
 ## 📖 Overview
 
-**K8gentS** acts as a dedicated observer within your Kubernetes cluster. Designed as an SRE assistant equipped with Deep Kubernetes Knowledge (CKA/CKS level), it leverages Large Language Models (LLMs) and robust system telemetry to automatically diagnose pod failures, resource exhaustion, and network bottlenecks. Its goal is to both drastically reduce operational mean time to repair (MTTR) as well as provide real-time visibilty into failed cluster resources.
+**K8gentS** is a continuously running observer inside your Kubernetes cluster. It watches the event stream for all `Warning`-class events — pod failures, node pressure, storage mount errors, config problems — and routes them through a Gemini-powered reasoning engine to produce root cause analysis and resolution steps. Its goal is to reduce MTTR and surface failure context that would otherwise require manual `kubectl` investigation.
 
 ---
 
@@ -14,20 +14,26 @@
 
 Building the Kubernetes side of this is straightforward. The real challenge is making a diagnostic layer trustworthy when the engine behind it is fundamentally non-deterministic.
 
-Traditional observability is built on guarantees. Alerts fire on known thresholds. Dashboards show reproducible numbers. Logs return consistent answers to the same query. SRE as a discipline depends on that predictability — it's what makes incident response repeatable and on-call sustainable.
+Traditional observability is built on guarantees. Alerts fire on known thresholds. Dashboards show reproducible numbers. Logs return consistent answers to the same query. SRE success depends on that predictability — it's what makes incident response repeatable and on-call sustainable.
 
 An LLM-driven diagnostic layer breaks that contract. The same pod failure can produce three different plausible explanations across three different runs. Each may be coherent. Each may even be correct under different assumptions. But "plausible" is not the same as "right," and for infrastructure, the gap between them is where outages live.
 
 Some of the specific problems I've been working through while building K8gentS:
 
 **1. Confidence scoring with an unbounded output space.**
-The agent returns top-3 root causes with confidence metrics. But confidence in what, exactly? The model is not selecting from a fixed set of known failure modes — it's generating free-form hypotheses. A calibrated confidence score needs a reference distribution, and the distribution here is whatever the model happened to produce this run.
+The agent returns top-3 root causes with confidence metrics, but confidence in what, exactly? The model is not selecting from a fixed set of known failure modes — it's generating free-form hypotheses. A calibrated confidence score needs a reference distribution, and the distribution here is whatever the model happened to produce this run.
 
-**2. When to trust reasoning vs. fall back to deterministic checks.**
-Some failures (CrashLoopBackOff, OOMKilled) have canonical diagnostic paths. A deterministic check will be right every time. Others (DNS resolution, partial network partitions, config drift interacting with resource pressure) benefit from the model's ability to synthesize across signals. Drawing that line — and doing it at runtime — is non-trivial.
+**2. When to trust reasoning vs. fall back to deterministic checks. - THE ART**
+Some failures (CrashLoopBackOff, OOMKilled) have well-traveled diagnostic paths and a deterministic check will be right every time. Others benefit from the model's ability to interpolate across signals. Drawing that line — and doing it at runtime — is non-trivial and where the art really lies.
 
 **3. Evaluating an agent that's supposed to find failures you didn't anticipate.**
-The standard ML evaluation approach (ground truth labels, held-out test sets) assumes you know what "correct" looks like. For a diagnostic agent, part of the value is catching novel failure modes — by definition, failures you couldn't pre-enumerate. So what does a regression test even look like?
+The standard ML evaluation approach assumes you know what "correct" looks like. For a diagnostic agent, part of the value is catching novel failure modes — by definition, failures you couldn't pre-enumerate. So how do you decide what is wrong and what is right?
+
+**4. The "Tool in the Cluster" problem.**
+How do you monitor the monitor? Currently the service is set to run as a service in the cluster, but what if the service itself causes resource exhaustion, or is experiencing failures itself? How can you identify if the service itself is the cause of your issue?
+
+**5. Determining the right model for this problem.**
+With so many other types of Machine Learning models out there, is a non-deterministic large language model really the right choice or is another model better suited for infrastructure type problems?
 
 These are the questions I'm actively working on. If you've solved any of them — or have a sharper framing than I've got — I'd like to hear it.
 
