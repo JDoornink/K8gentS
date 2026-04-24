@@ -1,98 +1,156 @@
-<div align="center">
-  <h1>K8gentS ☸️🤖</h1>
-  <p><strong>An Autonomous AI-Driven Root Cause Analysis Agent for Kubernetes</strong></p>
-</div>
+# K8gentS ☸️🤖
+
+**An Autonomous AI-Driven Root Cause Analysis Agent for Kubernetes**
 
 ---
 
 ## 📖 Overview
-**K8gentS** acts as a dedicated observer within your Kubernetes cluster. Designed as an SRE assistant equipped with Deep Kubernetes Knowledge (CKA/CKS level), it leverages Large Language Models (LLMs) like **Google Gemini 3.1 Pro** and robust system telemetry to automatically diagnose pod failures, resource exhaustion, and network bottlenecks. Its goal is to drastically reduce operational mean time to repair (MTTR).
+
+**K8gentS** acts as a dedicated observer within your Kubernetes cluster. Designed as an SRE assistant equipped with Deep Kubernetes Knowledge (CKA/CKS level), it leverages Large Language Models (LLMs) and robust system telemetry to automatically diagnose pod failures, resource exhaustion, and network bottlenecks. Its goal is to both drastically reduce operational mean time to repair (MTTR) as well as provide real-time visibilty into failed cluster resources.
+
+---
+
+## 🧠 The Hard Problem
+
+Building the Kubernetes side of this is straightforward. The real challenge is making a diagnostic layer trustworthy when the engine behind it is fundamentally non-deterministic.
+
+Traditional observability is built on guarantees. Alerts fire on known thresholds. Dashboards show reproducible numbers. Logs return consistent answers to the same query. SRE as a discipline depends on that predictability — it's what makes incident response repeatable and on-call sustainable.
+
+An LLM-driven diagnostic layer breaks that contract. The same pod failure can produce three different plausible explanations across three different runs. Each may be coherent. Each may even be correct under different assumptions. But "plausible" is not the same as "right," and for infrastructure, the gap between them is where outages live.
+
+Some of the specific problems I've been working through while building K8gentS:
+
+**1. Confidence scoring with an unbounded output space.**
+The agent returns top-3 root causes with confidence metrics. But confidence in what, exactly? The model is not selecting from a fixed set of known failure modes — it's generating free-form hypotheses. A calibrated confidence score needs a reference distribution, and the distribution here is whatever the model happened to produce this run.
+
+**2. When to trust reasoning vs. fall back to deterministic checks.**
+Some failures (CrashLoopBackOff, OOMKilled) have canonical diagnostic paths. A deterministic check will be right every time. Others (DNS resolution, partial network partitions, config drift interacting with resource pressure) benefit from the model's ability to synthesize across signals. Drawing that line — and doing it at runtime — is non-trivial.
+
+**3. Evaluating an agent that's supposed to find failures you didn't anticipate.**
+The standard ML evaluation approach (ground truth labels, held-out test sets) assumes you know what "correct" looks like. For a diagnostic agent, part of the value is catching novel failure modes — by definition, failures you couldn't pre-enumerate. So what does a regression test even look like?
+
+These are the questions I'm actively working on. If you've solved any of them — or have a sharper framing than I've got — I'd like to hear it.
+
+---
 
 ## ✨ Core Responsibilities
+
 1. **Continuous Monitoring:** Watches the cluster for error events, crashed pods, `CrashLoopBackOff` states, `OOMKilled` events, and other failure conditions such as `Connectivity/DNS`, `Database Deadlock`, or `Secret/Config Missing`.
 2. **Automated Root Cause Analysis (RCA):** Upon detecting an anomaly, it securely fetches relevant context (recent logs, pod descriptions, event history), sanitizes it of secrets/PII, and sends this context to an LLM-based reasoning engine.
 3. **Notification & Confidence Scoring:** Notifies your designated Slack communication channel via Socket Mode with:
-   - A descriptive summary of the error.
-   - The top 3 possible root causes, each with an associated confidence metric.
-   - Step-by-step resolution instructions.
+   * A descriptive summary of the error.
+   * The top 3 possible root causes, each with an associated confidence metric.
+   * Step-by-step resolution instructions.
 4. **Interactive Remediation (Opt-in):** Prompts the user directly in Slack with interactive buttons: *"Approve Fix"* or *"I'll do it manually"*.
-   - **Default Posture - Read Only:** The agent is strictly **READ-ONLY**, making it exceptionally secure by default.
+   * **Default Posture - Read Only:** The agent is strictly **READ-ONLY**, making it exceptionally secure by default.
 
 ---
 
 ## 🛠️ Architecture & Security
-- **Air-Tight Execution:** The Agent's Pod utilizes a highly restrictive `securityContext` (`runAsNonRoot`, read-only filesystem, dropping all capabilities).
-- **Rate-Limiting & Economy:** Built-in hourly circuit breakers and smart event debouncing ensure noisy namespaces don't bankrupt your AI API token budget.
-- **Log Sanitization:** A robust regex sweeper strictly redacts IP addresses, internal domains, API Keys, and JWTs from logs *before* passing telemetry to the LLM.
-- **Ingress-Free Interaction:** Uses Slack Socket Mode to maintain interactive bidirectional chat functionality without requiring any exposed endpoints or Kubernetes Ingress rules.
+
+The agent is designed so that each layer independently limits blast radius — not as redundancy for its own sake, but because no single control is sufficient when the reasoning engine is non-deterministic.
+
+| Layer | Mechanism | What it prevents |
+|---|---|---|
+| **Pod security** | `runAsNonRoot`, read-only filesystem, all Linux capabilities dropped | Container escape, privilege escalation |
+| **RBAC** | Agent pod is strictly read-only; write verbs live only on `k8gent-executor-sa` | Agent compromise → cluster mutation |
+| **Ephemeral executor** | Short-lived Jobs via `k8gent-executor-sa`; `ttlSecondsAfterFinished=120` | Persistent foothold after remediation |
+| **OPA Gatekeeper** | Rego policy enforced at the API server admission layer | Executor escaping its scope, even if RBAC is misconfigured |
+| **Log sanitization** | Regex sweeper strips IPs, JWTs, API keys, emails before LLM call | Secrets exfiltration via LLM prompt |
+| **Rate limiting** | Hourly circuit breakers and event debouncing | Noise-driven API budget exhaustion |
+| **Ingress-free comms** | Slack Socket Mode; no exposed endpoints or Ingress rules | Inbound attack surface |
+
+The OPA Gatekeeper policy (defined in `deploy/helm/k8gents/templates/opa-gatekeeper/`) explicitly blocks the executor service account from modifying `serviceAccountName`, enabling `hostNetwork` or `hostPID`, operating inside `kube-system`, or mutating any resource kind other than pods and deployments — enforced directly at the Kubernetes API admission layer, independent of RBAC.
 
 ---
 
-## 🚀 Installation & Connection Guide
+## 🚀 Deployment
+
+K8gentS ships as a Helm chart. OPA Gatekeeper is a declared chart dependency — the security sandbox installs automatically alongside the agent.
 
 ### Prerequisites
-- A Kubernetes cluster (compatible with v1.20+)
-- `kubectl` configured and authenticated to the target cluster.
-- AI Provider API Key (e.g., Google Gemini API Key).
-- A Docker Registry to push the agent's image to.
 
-### 1. Configure Slack (Socket Mode)
-We highly recommend **Slack with Socket Mode** to receive interactive button clicks securely.
+* Kubernetes v1.20+, Helm 3
+* `kubectl` authenticated to the target cluster
+* A Google Gemini API key (`AI_API_KEY`)
+* A Slack app with Socket Mode enabled (generates `SLACK_BOT_TOKEN` starting `xoxb-` and `SLACK_APP_TOKEN` starting `xapp-`)
+* Slack channel ID (`SLACK_CHANNEL_ID`) and a comma-separated list of approver Slack user IDs (`ALLOWED_APPROVERS`)
 
-1. Open a browser and create a Slack App at `api.slack.com`.
-2. Enable **Socket Mode** (this generates an App-Level Token starting with `xapp-`).
+### 1. Configure Slack
+
+1. Create a Slack App at `api.slack.com`.
+2. Enable **Socket Mode** → generates an App-Level Token (`xapp-...`).
 3. Enable **Interactive Components**.
-4. Request `chat:write` and `chat:write.public` scopes under Oauth & Permissions (this generates a Bot Token starting with `xoxb-`).
+4. Add `chat:write` and `chat:write.public` OAuth scopes → generates a Bot Token (`xoxb-...`).
+5. Invite the bot to your alert channel and copy the Channel ID from channel settings.
 
 ### 2. Build and Push the Agent Image
-Before deploying, you must build the Python agent and push it to your container registry (e.g., Docker Hub, AWS ECR, or a local K8s registry).
 
 ```bash
 docker build -t your-registry/k8gent:latest .
 docker push your-registry/k8gent:latest
 ```
-*(Note: Be sure to update `deploy/deployment.yaml` line 20 with your actual image repository link!)*
 
-### 3. Prepare Secrets
-Create the secrets necessary for the Agent to securely interact with the AI engine and Slack.
+Update `image.repository` in `deploy/helm/k8gents/values.yaml` to match your registry path.
 
-```bash
-kubectl create namespace k8gent-system
-
-kubectl create secret generic k8gent-secrets \
-  --namespace=k8gent-system \
-  --from-literal=AI_API_KEY="your-api-key" \
-  --from-literal=SLACK_BOT_TOKEN="xoxb-your-bot-token" \
-  --from-literal=SLACK_APP_TOKEN="xapp-your-app-token" \
-  --from-literal=SLACK_CHANNEL_ID="C12345678"
-```
-
-### 4. Deploy the Manifests
-Apply the provided RBAC rules and Deployment manifests. 
-The RBAC explicitly limits the Agent to `get`, `list`, and `watch` verbs across the cluster.
+### 3. Install via Helm
 
 ```bash
-kubectl apply -f deploy/rbac.yaml
-kubectl apply -f deploy/deployment.yaml
+# Fetch chart dependencies (downloads OPA Gatekeeper)
+helm dependency update deploy/helm/k8gents
+
+# Install — secrets are injected at deploy time, never stored in source
+helm install k8gents deploy/helm/k8gents \
+  --namespace k8gent-system \
+  --create-namespace \
+  --set secrets.aiApiKey="YOUR_GEMINI_KEY" \
+  --set secrets.slackBotToken="xoxb-..." \
+  --set secrets.slackAppToken="xapp-..." \
+  --set secrets.slackChannelId="C12345678" \
+  --set secrets.allowedApprovers="U123456,U789012"
 ```
 
-### 5. Verify Installation
-Check the agent pod logs to ensure it successfully connected to the cluster and initialized the AI models.
+To disable the OPA sandbox (if your cluster already runs Gatekeeper with its own policies):
+```bash
+--set sandbox.enabled=false --set gatekeeper.enabled=false
+```
+
+### 4. Verify Installation
 
 ```bash
-kubectl logs -l app=k8gent -n k8gent-system -f
+kubectl logs -l app=k8gents -n k8gent-system -f
 ```
+
+You should see the watcher connect to the cluster API and the Slack Socket Mode connection initialize.
 
 ---
 
-## 🔮 Future Customization
-To define what specific namespaces or events to watch, or to utilize different LLM architectures, simply modify the `WATCH_NAMESPACE` and `AI_MODEL` environment variables defined in the `deployment.yaml` (or in your local shell). If `WATCH_NAMESPACE` is omitted, the agent will monitor all namespaces globally.
+## ⚙️ Configuration
 
-> **Note on LLM Upgrades:** If Google releases a newer model version (e.g., Gemini 3.5 or 4.0), you do not need to modify the Python codebase. You can simply set `$env:AI_MODEL="gemini-new-model-name"` before running the script, and the agent will dynamically route internal tracking and prompts to the newest reasoning engine.
+Key environment variables (set via `--set agent.*` in Helm, or directly if running locally):
+
+| Variable | Default | Description |
+|---|---|---|
+| `WATCH_NAMESPACES` | `all` | Comma-separated namespaces to watch, or `all` for cluster-wide |
+| `AI_MODEL` | `gemini-2.5-pro` | Any model name supported by the Google GenAI SDK |
+| `LOG_LEVEL` | `INFO` | Python logging level |
+| `REMEDIATION_MODE` | `api` | `api` (Kubernetes client, safe in-cluster) or `subprocess` (kubectl, local dev only) |
+
+Changing `AI_MODEL` requires no code changes — the agent routes all LLM calls through the configured model name dynamically.
 
 ---
 
-## 🚀 Where to go from here
-The core monitoring pipeline is fully functional! The next phase of development focuses on executing automated remediation.
-- In `src/main.py`, the interactive Slack buttons (like **"Approve Fix"**) currently trigger a simulated API patch (`time.sleep(2)`).
-- The next step is to bind those handler functions to genuine Kubernetes API patching commands so the agent can securely execute the suggested remediation plan the moment a human clicks "Approve".
+## 🔮 What's Next
+
+What's implemented and working:
+* Watch → diagnose → Slack notification with confidence scoring
+* Human-gated remediation via Slack interactive buttons
+* Ephemeral Job executor with OPA Gatekeeper admission sandbox
+* MCP server for on-demand diagnostics from AI clients
+* Helm chart with Gatekeeper as a hard dependency
+
+What's genuinely unsolved:
+* **Confidence calibration** — the current scoring reflects the model's self-reported certainty, which doesn't reliably correlate with empirical accuracy.
+* **Deterministic routing** — canonically diagnosable failures (CrashLoopBackOff, OOMKilled) shouldn't route through the LLM at all. Building a reliable runtime classifier for "known answer" vs. "needs reasoning" is the next structural change.
+* **Evaluation** — regression testing an agent designed to catch novel failures requires a framework that doesn't yet fully exist for this problem domain. Synthetic failure injection (chaos engineering) is the most promising direction, but coverage is inherently limited.
+* **Post-remediation verification** — after executing a fix, monitor the target namespace for 60s and post a follow-up Slack thread confirming recovery or flagging that the crash state persists.
