@@ -1,0 +1,43 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.JDoornink/k8gents",
+  "title": "K8gentS — Kubernetes RCA MCP Server",
+  "description": "Autonomous Kubernetes RCA agent with OPA Gatekeeper sandbox and MCP diagnostics for Claude/Cursor.",
+  "repository": {
+    "url": "https://github.com/JDoornink/K8gentS",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "docker.io/jdoornink/k8gents:0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "AI_API_KEY",
+          "description": "Google Gemini API key for LLM-powered root cause analysis",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "AI_MODEL",
+          "description": "Gemini model to use (default: gemini-2.5-pro)",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "KUBECONFIG",
+          "description": "Path to kubeconfig file. Omit to use in-cluster config or ~/.kube/config automatically.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

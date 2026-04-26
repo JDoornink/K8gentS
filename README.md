@@ -2,6 +2,8 @@
 
 **An Autonomous AI-Driven Root Cause Analysis Agent for Kubernetes**
 
+[![MCP Registry](https://img.shields.io/badge/MCP_Registry-io.github.JDoornink%2Fk8gents-blue)](https://registry.modelcontextprotocol.io)
+
 ---
 
 ## 📖 Overview
@@ -152,7 +154,7 @@ What's implemented and working:
 * Watch → diagnose → Slack notification with confidence scoring
 * Human-gated remediation via Slack interactive buttons
 * Ephemeral Job executor with OPA Gatekeeper admission sandbox
-* MCP server for on-demand diagnostics from AI clients
+* MCP server for on-demand diagnostics from AI clients — [published on the MCP Registry](https://registry.modelcontextprotocol.io) as `io.github.JDoornink/k8gents`
 * Helm chart with Gatekeeper as a hard dependency
 
 What's genuinely unsolved:

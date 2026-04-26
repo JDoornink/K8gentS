@@ -138,6 +138,7 @@ celerybeat.pid
 approvers.local
 data/k8gent.db
 data/settings.json
+mcp-publisher.exe
 
 # Environments
 .env

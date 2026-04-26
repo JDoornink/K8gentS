@@ -1,0 +1,16 @@
+FROM python:3.11-slim
+
+LABEL io.modelcontextprotocol.server.name="io.github.JDoornink/k8gents"
+
+RUN useradd -u 1000 -m agent
+
+WORKDIR /app
+
+COPY src/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/mcp_server.py .
+
+USER 1000
+
+CMD ["python", "mcp_server.py"]
