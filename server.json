@@ -2,16 +2,16 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.JDoornink/k8gents",
   "title": "K8gentS — Kubernetes RCA MCP Server",
-  "description": "Autonomous Kubernetes RCA agent with OPA Gatekeeper sandbox and MCP diagnostics for Claude/Cursor.",
+  "description": "Kubernetes RCA agent that sandboxes its own AI with OPA Gatekeeper. MCP-ready for any client.",
   "repository": {
     "url": "https://github.com/JDoornink/K8gentS",
     "source": "github"
   },
-  "version": "0.1.0",
+  "version": "0.1.1",
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "docker.io/jdoornink/k8gents:0.1.0",
+      "identifier": "docker.io/jdoornink/k8gents:0.1.1",
       "transport": {
         "type": "stdio"
       },
