@@ -1,6 +1,6 @@
 # K8gentS ☸️🤖
 
-**An Autonomous AI-Driven Root Cause Analysis Agent for Kubernetes**
+**A Human-in-the-Loop RCA Agent for Kubernetes — LLM Diagnosis, OPA-Bounded Remediation**
 
 [![MCP Registry](https://img.shields.io/badge/MCP_Registry-io.github.JDoornink%2Fk8gents-blue)](https://registry.modelcontextprotocol.io)
 
@@ -8,7 +8,9 @@
 
 ## 📖 Overview
 
-**K8gentS** is a continuously running observer inside your Kubernetes cluster. It watches the event stream for all `Warning`-class events — pod failures, node pressure, storage mount errors, config problems — and routes them through a Gemini-powered reasoning engine to produce root cause analysis and resolution steps. Its goal is to reduce MTTR and surface failure context that would otherwise require manual `kubectl` investigation.
+**K8gentS** is a Kubernetes diagnostic agent built around a single premise: an LLM is well-suited to *reason* about cluster failures, but unfit to *act* on them unsupervised. It continuously watches the cluster event stream, runs `Warning`-class events through a Gemini-powered **root cause analysis (RCA)** pipeline, and surfaces the top hypotheses with resolution steps to Slack. Every remediation is **human-in-the-loop (HITL)** — a reviewer approves or rejects via interactive buttons before anything mutates. Approved fixes execute inside an ephemeral Job whose blast radius is bounded by an **OPA Gatekeeper** admission policy at the API server, independent of RBAC. The reasoning is non-deterministic by design; the controls around it are not.
+
+The goal: reduce MTTR on diagnosable failures without handing an LLM a `kubectl apply`.
 
 ---
 
